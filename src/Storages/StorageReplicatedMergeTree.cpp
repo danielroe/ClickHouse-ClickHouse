@@ -2541,7 +2541,7 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
                 parts_to_remove_str += part.getPartName();
                 parts_to_remove_str += " ";
             }
-            LOG_TRACE(log, "Replacing {} parts {}with empty set", parts_to_remove.size(), parts_to_remove_str);
+            LOG_TRACE(log, "Replacing {} parts {} with empty set", parts_to_remove.size(), parts_to_remove_str);
         }
     }
 
@@ -2852,7 +2852,7 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
                     parts_to_remove_str += part.getPartName();
                     parts_to_remove_str += " ";
                 }
-                LOG_TRACE(log, "Replacing {} parts {}with {} parts {}", parts_to_remove.size(), parts_to_remove_str,
+                LOG_TRACE(log, "Replacing {} parts {} with {} parts {}", parts_to_remove.size(), parts_to_remove_str,
                           final_parts.size(), boost::algorithm::join(final_part_names, ", "));
             }
         }
@@ -8195,7 +8195,8 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
     auto src_data_id = src_data.getStorageID();
     String partition_id = getPartitionIDFromQuery(partition, query_context);
 
-    /// A range for log entry to remove parts from the source table (myself).
+    PartsToRemoveFromZooKeeper parts_to_remove;
+
     auto zookeeper = getZooKeeper();
     /// Retry if alter_partition_version changes
     for (size_t retry = 0; retry < 1000; ++retry)
@@ -8333,6 +8334,8 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
 
         /// We should hold replaced parts until we actually create DROP_RANGE in ZooKeeper
         DataPartsVector parts_holder;
+        size_t create_dst_replace_range_resp_index{0u};
+        size_t create_src_drop_range_resp_index{0u};
         try
         {
             Coordination::Requests ops;
@@ -8346,8 +8349,18 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
             ops.emplace_back(zkutil::makeSetRequest(dest_alter_partition_version_path, "", dest_alter_partition_version_stat.version));
             /// Just update version, because merges assignment relies on it
             ops.emplace_back(zkutil::makeSetRequest(fs::path(dest_table_storage->zookeeper_path) / "log", "", -1));
+
+            create_dst_replace_range_resp_index = ops.size();
             ops.emplace_back(zkutil::makeCreateRequest(fs::path(dest_table_storage->zookeeper_path) / "log/log-",
                                                        entry.toString(), zkutil::CreateMode::PersistentSequential));
+
+            /// Create DROP_RANGE for the source table
+            create_src_drop_range_resp_index = ops.size();
+            ops.emplace_back(zkutil::makeCreateRequest(
+                fs::path(zookeeper_path) / "log/log-", entry_delete.toString(), zkutil::CreateMode::PersistentSequential));
+            /// Just update version, because merges assignment relies on it
+            ops.emplace_back(zkutil::makeSetRequest(fs::path(zookeeper_path) / "log", "", -1));
+            delimiting_block_lock->getUnlockOp(ops);
 
             {
                 Transaction transaction(*dest_table_storage, NO_TRANSACTION_RAW);
@@ -8368,10 +8381,15 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
                     zkutil::KeeperMultiException::check(code, ops, op_results);
 
                 parts_holder = getDataPartsVectorInPartitionForInternalUsage(MergeTreeDataPartState::Active, drop_range.partition_id, &src_data_parts_lock);
-                /// We ignore the list of parts returned from the function below because we cannot remove them from zk
-                /// because we have not created the DROP_RANGE yet. Yes, MOVE PARTITION is trash.
-                removePartsInRangeFromWorkingSetAndGetPartsToRemoveFromZooKeeper(NO_TRANSACTION_RAW, drop_range, src_data_parts_lock);
-                transaction.commit(&src_data_parts_lock);
+
+                getContext()->getMergeList().cancelInPartition(getStorageID(), drop_range.partition_id, drop_range.max_block);
+                {
+                    auto pause_checking_parts = part_check_thread.pausePartsCheck();
+                    queue.removePartProducingOpsInRange(getZooKeeper(), drop_range, entry);
+                    part_check_thread.cancelRemovedPartsCheck(drop_range);
+                }
+                parts_to_remove = removePartsInRangeFromWorkingSetAndGetPartsToRemoveFromZooKeeper(NO_TRANSACTION_RAW, drop_range, src_data_parts_lock);
+                transaction.commit(&dest_data_parts_lock);
             }
 
             PartLog::addNewParts(getContext(), PartLog::createPartLogEntries(dst_parts, watch.elapsed(), profile_events_scope.getSnapshot()));
@@ -8386,7 +8404,10 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
             throw;
         }
 
-        String log_znode_path = dynamic_cast<const Coordination::CreateResponse &>(*op_results.back()).path_created;
+        removePartsFromZooKeeperWithRetries(parts_to_remove);
+
+        chassert(op_results.size() > create_dst_replace_range_resp_index && "We have less responses than we expected!");
+        String log_znode_path = dynamic_cast<const Coordination::CreateResponse &>(*op_results[create_dst_replace_range_resp_index]).path_created;
         entry.znode_name = log_znode_path.substr(log_znode_path.find_last_of('/') + 1);
 
         for (auto & lock : ephemeral_locks)
@@ -8396,17 +8417,8 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
 
         dest_table_storage->waitForLogEntryToBeProcessedIfNecessary(entry, query_context);
 
-        /// Create DROP_RANGE for the source table
-        Coordination::Requests ops_src;
-        ops_src.emplace_back(zkutil::makeCreateRequest(
-            fs::path(zookeeper_path) / "log/log-", entry_delete.toString(), zkutil::CreateMode::PersistentSequential));
-        /// Just update version, because merges assignment relies on it
-        ops_src.emplace_back(zkutil::makeSetRequest(fs::path(zookeeper_path) / "log", "", -1));
-        delimiting_block_lock->getUnlockOp(ops_src);
-
-        op_results = zookeeper->multi(ops_src);
-
-        log_znode_path = dynamic_cast<const Coordination::CreateResponse &>(*op_results.front()).path_created;
+        chassert(op_results.size() > create_src_drop_range_resp_index && "We have less responses than we expected!");
+        log_znode_path = dynamic_cast<const Coordination::CreateResponse &>(*op_results[create_src_drop_range_resp_index]).path_created;
         entry_delete.znode_name = log_znode_path.substr(log_znode_path.find_last_of('/') + 1);
 
         lock1.reset();
