@@ -8382,12 +8382,17 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
 
                 parts_holder = getDataPartsVectorInPartitionForInternalUsage(MergeTreeDataPartState::Active, drop_range.partition_id, &src_data_parts_lock);
 
+                /// We need to pull the DROP_RANGE before
+                /// - cancelling merges (to prevent new merges to start)
+                /// - and cleaning the replaced parts (otherwise CheckThread may decide that parts are lost)
+                queue.pullLogsToQueue(getZooKeeperAndAssertNotReadonly(), {}, ReplicatedMergeTreeQueue::SYNC);
                 getContext()->getMergeList().cancelInPartition(getStorageID(), drop_range.partition_id, drop_range.max_block);
                 {
                     auto pause_checking_parts = part_check_thread.pausePartsCheck();
                     queue.removePartProducingOpsInRange(getZooKeeper(), drop_range, entry);
                     part_check_thread.cancelRemovedPartsCheck(drop_range);
                 }
+
                 parts_to_remove = removePartsInRangeFromWorkingSetAndGetPartsToRemoveFromZooKeeper(NO_TRANSACTION_RAW, drop_range, src_data_parts_lock);
                 transaction.commit(&dest_data_parts_lock);
             }
@@ -8406,6 +8411,9 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
 
         removePartsFromZooKeeperWithRetries(parts_to_remove);
 
+        parts_holder.clear();
+        cleanup_thread.wakeup();
+
         chassert(op_results.size() > create_dst_replace_range_resp_index && "We have less responses than we expected!");
         String log_znode_path = dynamic_cast<const Coordination::CreateResponse &>(*op_results[create_dst_replace_range_resp_index]).path_created;
         entry.znode_name = log_znode_path.substr(log_znode_path.find_last_of('/') + 1);
@@ -8422,11 +8430,6 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
         entry_delete.znode_name = log_znode_path.substr(log_znode_path.find_last_of('/') + 1);
 
         lock1.reset();
-
-        /// We need to pull the DROP_RANGE before cleaning the replaced parts (otherwise CHeckThread may decide that parts are lost)
-        queue.pullLogsToQueue(getZooKeeperAndAssertNotReadonly(), {}, ReplicatedMergeTreeQueue::SYNC);
-        parts_holder.clear();
-        cleanup_thread.wakeup();
 
         waitForLogEntryToBeProcessedIfNecessary(entry_delete, query_context);
 
