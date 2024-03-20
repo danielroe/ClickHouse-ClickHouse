@@ -8074,7 +8074,6 @@ void StorageReplicatedMergeTree::replacePartitionFrom(
         }
 
         Coordination::Responses op_results;
-        DataPartsVector parts_holder;
 
         try
         {
@@ -8135,7 +8134,6 @@ void StorageReplicatedMergeTree::replacePartitionFrom(
                         queue.removePartProducingOpsInRange(getZooKeeper(), drop_range, entry);
                         part_check_thread.cancelRemovedPartsCheck(drop_range);
                     }
-                    parts_holder = getDataPartsVectorInPartitionForInternalUsage(MergeTreeDataPartState::Active, drop_range.partition_id, &data_parts_lock);
                     /// We ignore the list of parts returned from the function below. We will remove them from zk when executing REPLACE_RANGE
                     removePartsInRangeFromWorkingSetAndGetPartsToRemoveFromZooKeeper(NO_TRANSACTION_RAW, drop_range, data_parts_lock);
                 }
@@ -8161,7 +8159,6 @@ void StorageReplicatedMergeTree::replacePartitionFrom(
         lock2.reset();
         lock1.reset();
 
-        parts_holder.clear();
         cleanup_thread.wakeup();
 
 
@@ -8338,8 +8335,6 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
 
         Coordination::Responses op_results;
 
-        /// We should hold replaced parts until we actually create DROP_RANGE in ZooKeeper
-        DataPartsVector parts_holder;
         size_t create_dst_replace_range_resp_index{0u};
         size_t create_src_drop_range_resp_index{0u};
         try
@@ -8396,7 +8391,6 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
                     queue.removePartProducingOpsInRange(getZooKeeper(), drop_range, entry);
                     part_check_thread.cancelRemovedPartsCheck(drop_range);
                 }
-                parts_holder = getDataPartsVectorInPartitionForInternalUsage(MergeTreeDataPartState::Active, drop_range.partition_id, &src_data_parts_lock);
                 /// We ignore the list of parts returned from the function below. We will remove them from zk when executing DROP_RANGE
                 removePartsInRangeFromWorkingSetAndGetPartsToRemoveFromZooKeeper(NO_TRANSACTION_RAW, drop_range, src_data_parts_lock);
                 transaction.commit(&dest_data_parts_lock);
@@ -8414,7 +8408,6 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
             throw;
         }
 
-        parts_holder.clear();
         cleanup_thread.wakeup();
 
         chassert(op_results.size() > create_dst_replace_range_resp_index && "We have less responses than we expected!");
