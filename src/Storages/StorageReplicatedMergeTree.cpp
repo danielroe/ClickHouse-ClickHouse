@@ -8125,6 +8125,16 @@ void StorageReplicatedMergeTree::replacePartitionFrom(
                 transaction.commit(&data_parts_lock);
                 if (replace)
                 {
+                    /// We need to pull the REPLACE_RANGE before
+                    /// - cancelling merges (to prevent new merges to start)
+                    /// - and cleaning the replaced parts (otherwise CheckThread may decide that parts are lost)
+                    queue.pullLogsToQueue(getZooKeeperAndAssertNotReadonly(), {}, ReplicatedMergeTreeQueue::SYNC);
+                    getContext()->getMergeList().cancelInPartition(getStorageID(), drop_range.partition_id, drop_range.max_block);
+                    {
+                        auto pause_checking_parts = part_check_thread.pausePartsCheck();
+                        queue.removePartProducingOpsInRange(getZooKeeper(), drop_range, entry);
+                        part_check_thread.cancelRemovedPartsCheck(drop_range);
+                    }
                     parts_holder = getDataPartsVectorInPartitionForInternalUsage(MergeTreeDataPartState::Active, drop_range.partition_id, &data_parts_lock);
                     /// We ignore the list of parts returned from the function below. We will remove them from zk when executing REPLACE_RANGE
                     removePartsInRangeFromWorkingSetAndGetPartsToRemoveFromZooKeeper(NO_TRANSACTION_RAW, drop_range, data_parts_lock);
