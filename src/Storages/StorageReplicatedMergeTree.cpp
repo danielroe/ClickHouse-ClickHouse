@@ -8161,8 +8161,6 @@ void StorageReplicatedMergeTree::replacePartitionFrom(
         lock2.reset();
         lock1.reset();
 
-        /// We need to pull the DROP_RANGE before cleaning the replaced parts (otherwise CHeckThread may decide that parts are lost)
-        queue.pullLogsToQueue(getZooKeeperAndAssertNotReadonly(), {}, ReplicatedMergeTreeQueue::SYNC);
         parts_holder.clear();
         cleanup_thread.wakeup();
 
@@ -8204,8 +8202,6 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
     MergeTreeData & src_data = dest_table_storage->checkStructureAndGetMergeTreeData(*this, metadata_snapshot, dest_metadata_snapshot);
     auto src_data_id = src_data.getStorageID();
     String partition_id = getPartitionIDFromQuery(partition, query_context);
-
-    PartsToRemoveFromZooKeeper parts_to_remove;
 
     auto zookeeper = getZooKeeper();
     /// Retry if alter_partition_version changes
@@ -8390,8 +8386,6 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
                 else
                     zkutil::KeeperMultiException::check(code, ops, op_results);
 
-                parts_holder = getDataPartsVectorInPartitionForInternalUsage(MergeTreeDataPartState::Active, drop_range.partition_id, &src_data_parts_lock);
-
                 /// We need to pull the DROP_RANGE before
                 /// - cancelling merges (to prevent new merges to start)
                 /// - and cleaning the replaced parts (otherwise CheckThread may decide that parts are lost)
@@ -8402,8 +8396,9 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
                     queue.removePartProducingOpsInRange(getZooKeeper(), drop_range, entry);
                     part_check_thread.cancelRemovedPartsCheck(drop_range);
                 }
-
-                parts_to_remove = removePartsInRangeFromWorkingSetAndGetPartsToRemoveFromZooKeeper(NO_TRANSACTION_RAW, drop_range, src_data_parts_lock);
+                parts_holder = getDataPartsVectorInPartitionForInternalUsage(MergeTreeDataPartState::Active, drop_range.partition_id, &src_data_parts_lock);
+                /// We ignore the list of parts returned from the function below. We will remove them from zk when executing DROP_RANGE
+                removePartsInRangeFromWorkingSetAndGetPartsToRemoveFromZooKeeper(NO_TRANSACTION_RAW, drop_range, src_data_parts_lock);
                 transaction.commit(&dest_data_parts_lock);
             }
 
@@ -8418,8 +8413,6 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
 
             throw;
         }
-
-        removePartsFromZooKeeperWithRetries(parts_to_remove);
 
         parts_holder.clear();
         cleanup_thread.wakeup();
