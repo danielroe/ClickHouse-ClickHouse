@@ -2364,10 +2364,14 @@ void StorageReplicatedMergeTree::executeDropRange(const LogEntry & entry)
     /// command must be applied to all parts on disk.
     waitForOutdatedPartsToBeLoaded();
 
+    LOG_TRACE(log, "executeDropRange: cancelling merges in partition");
     getContext()->getMergeList().cancelInPartition(getStorageID(), drop_range_info.partition_id, drop_range_info.max_block);
     {
+        LOG_TRACE(log, "executeDropRange: pausing part check thread");
         auto pause_checking_parts = part_check_thread.pausePartsCheck();
+        LOG_TRACE(log, "executeDropRange: removing part producing ops");
         queue.removePartProducingOpsInRange(getZooKeeper(), drop_range_info, entry);
+        LOG_TRACE(log, "executeDropRange: cancelling removed parts check");
         part_check_thread.cancelRemovedPartsCheck(drop_range_info);
     }
 
@@ -2410,8 +2414,10 @@ void StorageReplicatedMergeTree::executeDropRange(const LogEntry & entry)
         }
     }
 
+    LOG_TRACE(log, "executeDropRange: removePartsFromZooKeeperWithRetries");
     /// Forcibly remove parts from ZooKeeper
     removePartsFromZooKeeperWithRetries(parts_to_remove);
+    LOG_TRACE(log, "executeDropRange: paranoidCheckForCoveredPartsInZooKeeper");
     paranoidCheckForCoveredPartsInZooKeeper(getZooKeeper(), replica_path, format_version, entry.new_part_name);
 
     if (entry.detach)
@@ -2423,6 +2429,8 @@ void StorageReplicatedMergeTree::executeDropRange(const LogEntry & entry)
     /// To be removed a partition should have zero refcount, therefore call the cleanup thread at exit
     parts_to_remove.clear();
     cleanup_thread.wakeup();
+
+    LOG_TRACE(log, "executeDropRange: return");
 }
 
 
@@ -2450,9 +2458,13 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
 
     if (replace)
     {
+        LOG_TRACE(log, "executeReplaceRange: cancelling merges in partition");
         getContext()->getMergeList().cancelInPartition(getStorageID(), drop_range.partition_id, drop_range.max_block);
+        LOG_TRACE(log, "executeReplaceRange: pausing part check thread");
         auto pause_checking_parts = part_check_thread.pausePartsCheck();
+        LOG_TRACE(log, "executeReplaceRange: removing part producing ops");
         queue.removePartProducingOpsInRange(getZooKeeper(), drop_range, entry);
+        LOG_TRACE(log, "executeReplaceRange: cancelling removed parts check");
         part_check_thread.cancelRemovedPartsCheck(drop_range);
     }
     else
@@ -2811,11 +2823,15 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "There is no receipt to produce part {}. This is bug", part_desc->new_part_name);
     };
 
+    LOG_TRACE(log, "replacePartitionFrom: obtaining parts");
     /// Download or clone parts
     /// TODO: make it in parallel
     for (PartDescriptionPtr & part_desc : final_parts)
+    {
+        LOG_TRACE(log, "executeReplaceRange: obtaining part {}", part_desc->new_part_name);
         obtain_part(part_desc);
-
+        LOG_TRACE(log, "executeReplaceRange: part {} is obtained", part_desc->new_part_name);
+    }
     MutableDataPartsVector res_parts;
     for (PartDescriptionPtr & part_desc : final_parts)
         res_parts.emplace_back(part_desc->res_part);
@@ -2823,6 +2839,8 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
     try
     {
         /// Commit parts
+
+        LOG_TRACE(log, "executeReplaceRange: committing parts");
         auto zookeeper = getZooKeeper();
         Transaction transaction(*this, NO_TRANSACTION_RAW);
 
@@ -2840,11 +2858,13 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
             zookeeper->multi(ops);
 
         {
+            LOG_TRACE(log, "executeReplaceRange: locking parts");
             auto data_parts_lock = lockParts();
 
             transaction.commit(&data_parts_lock);
             if (replace)
             {
+                LOG_TRACE(log, "replacePartitionFrom: removePartsInRangeFromWorkingSetAndGetPartsToRemoveFromZooKeeper");
                 parts_to_remove = removePartsInRangeFromWorkingSetAndGetPartsToRemoveFromZooKeeper(NO_TRANSACTION_RAW, drop_range, data_parts_lock);
                 String parts_to_remove_str;
                 for (const auto & part : parts_to_remove)
@@ -2869,6 +2889,7 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
         throw;
     }
 
+    LOG_TRACE(log, "replacePartitionFrom: removePartsFromZooKeeperWithRetries");
     removePartsFromZooKeeperWithRetries(parts_to_remove);
     if (replace)
         paranoidCheckForCoveredPartsInZooKeeper(getZooKeeper(), replica_path, format_version, entry_replace.drop_range_part_name);
@@ -2876,6 +2897,7 @@ bool StorageReplicatedMergeTree::executeReplaceRange(LogEntry & entry)
     parts_to_remove.clear();
     cleanup_thread.wakeup();
 
+    LOG_TRACE(log, "replacePartitionFrom: return");
     return true;
 }
 
@@ -8122,22 +8144,32 @@ void StorageReplicatedMergeTree::replacePartitionFrom(
             {
                 auto data_parts_lock = lockParts();
                 transaction.commit(&data_parts_lock);
+
+                LOG_TRACE(log, "replacePartitionFrom: transaction committed");
                 if (replace)
                 {
                     /// We need to pull the REPLACE_RANGE before
                     /// - cancelling merges (to prevent new merges to start)
                     /// - and cleaning the replaced parts (otherwise CheckThread may decide that parts are lost)
+
+                    LOG_TRACE(log, "replacePartitionFrom: pulling logs to queue");
                     queue.pullLogsToQueue(getZooKeeperAndAssertNotReadonly(), {}, ReplicatedMergeTreeQueue::SYNC);
+                    LOG_TRACE(log, "replacePartitionFrom: cancelling merges in partition");
                     getContext()->getMergeList().cancelInPartition(getStorageID(), drop_range.partition_id, drop_range.max_block);
                     {
+                        LOG_TRACE(log, "replacePartitionFrom: pausing part chekc thread");
                         auto pause_checking_parts = part_check_thread.pausePartsCheck();
+                        LOG_TRACE(log, "replacePartitionFrom: removing part producing ops ");
                         queue.removePartProducingOpsInRange(getZooKeeper(), drop_range, entry);
+                        LOG_TRACE(log, "replacePartitionFrom: cancelling removed parts check");
                         part_check_thread.cancelRemovedPartsCheck(drop_range);
                     }
+                    LOG_TRACE(log, "replacePartitionFrom: removing parts in range from working set");
                     /// We ignore the list of parts returned from the function below. We will remove them from zk when executing REPLACE_RANGE
                     removePartsInRangeFromWorkingSetAndGetPartsToRemoveFromZooKeeper(NO_TRANSACTION_RAW, drop_range, data_parts_lock);
                 }
             }
+            LOG_TRACE(log, "replacePartitionFrom: lock is released");
 
             PartLog::addNewParts(getContext(), PartLog::createPartLogEntries(dst_parts, watch.elapsed(), profile_events_scope.getSnapshot()));
         }
@@ -8384,17 +8416,25 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
                 /// We need to pull the DROP_RANGE before
                 /// - cancelling merges (to prevent new merges to start)
                 /// - and cleaning the replaced parts (otherwise CheckThread may decide that parts are lost)
+
+                LOG_TRACE(log, "movePartitionToTable: Pulling logs to queue");
                 queue.pullLogsToQueue(getZooKeeperAndAssertNotReadonly(), {}, ReplicatedMergeTreeQueue::SYNC);
+                LOG_TRACE(log, "movePartitionToTable: Cancelling merges in partition");
                 getContext()->getMergeList().cancelInPartition(getStorageID(), drop_range.partition_id, drop_range.max_block);
                 {
+                    LOG_TRACE(log, "movePartitionToTable: Pausing part check thread");
                     auto pause_checking_parts = part_check_thread.pausePartsCheck();
+                    LOG_TRACE(log, "movePartitionToTable: Removing part producing ops in range");
                     queue.removePartProducingOpsInRange(getZooKeeper(), drop_range, entry);
+                    LOG_TRACE(log, "movePartitionToTable: Cancelling removed parts check");
                     part_check_thread.cancelRemovedPartsCheck(drop_range);
                 }
+                LOG_TRACE(log, "movePartitionToTable: Removing parts in range from working set");
                 /// We ignore the list of parts returned from the function below. We will remove them from zk when executing DROP_RANGE
                 removePartsInRangeFromWorkingSetAndGetPartsToRemoveFromZooKeeper(NO_TRANSACTION_RAW, drop_range, src_data_parts_lock);
                 transaction.commit(&dest_data_parts_lock);
             }
+            LOG_TRACE(log, "movePartitionToTable: Locks released");
 
             PartLog::addNewParts(getContext(), PartLog::createPartLogEntries(dst_parts, watch.elapsed(), profile_events_scope.getSnapshot()));
         }
