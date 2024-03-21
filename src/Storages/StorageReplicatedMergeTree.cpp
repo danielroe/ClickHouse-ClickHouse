@@ -8157,7 +8157,7 @@ void StorageReplicatedMergeTree::replacePartitionFrom(
                     LOG_TRACE(log, "replacePartitionFrom: cancelling merges in partition");
                     getContext()->getMergeList().cancelInPartition(getStorageID(), drop_range.partition_id, drop_range.max_block);
                     {
-                        LOG_TRACE(log, "replacePartitionFrom: pausing part chekc thread");
+                        LOG_TRACE(log, "replacePartitionFrom: pausing part check thread");
                         auto pause_checking_parts = part_check_thread.pausePartsCheck();
                         LOG_TRACE(log, "replacePartitionFrom: removing part producing ops ");
                         queue.removePartProducingOpsInRange(getZooKeeper(), drop_range, entry);

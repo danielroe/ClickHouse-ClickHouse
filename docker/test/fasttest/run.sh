@@ -271,6 +271,7 @@ function run_tests
         --shard
         --zookeeper
         --check-zookeeper-session
+        --max-failures-chain 3
         --order random
         --print-time
         --report-logs-stats
